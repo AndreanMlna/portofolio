@@ -3623,20 +3623,42 @@ function limb(r, a, b, mat, parent, caps = 6, rad = 16) {
   return add(m, parent);
 }
 
-/* ================= renderer / post ================= */
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
+/* ================= renderer / post (Adaptive High-Performance for Low-End & Potato Devices) ================= */
+const isPotatoDevice = (function() {
+  if (typeof navigator === 'undefined') return false;
+  const cores = navigator.hardwareConcurrency || 4;
+  const mem = navigator.deviceMemory || 4;
+  const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+  return cores <= 4 || mem <= 4 || isMobile;
+})();
+
+const renderer = new THREE.WebGLRenderer({
+  canvas,
+  antialias: false,
+  powerPreference: 'high-performance',
+  precision: isPotatoDevice ? 'mediump' : 'highp'
+});
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 0.92;
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-let DPR = Math.min(window.devicePixelRatio || 1, 1.5);   // 1.5x on retina: the VHS pass + MSAA are fill-bound; the loop steps down further if frames run long
+renderer.shadowMap.type = isPotatoDevice ? THREE.PCFShadowMap : THREE.PCFSoftShadowMap;
+// Cap DPR to 1.0 on low-power devices, 1.15 on desktop for optimal 60fps throughput
+let DPR = isPotatoDevice ? Math.min(window.devicePixelRatio || 1, 1.0) : Math.min(window.devicePixelRatio || 1, 1.15);
 
 scene.background = new THREE.Color(0xb9b09d);
 scene.fog = new THREE.FogExp2(0xb9b09d, 0.014);
 const camera = new THREE.PerspectiveCamera(55, 1.6, 0.1, 80);
 
-const rt = new THREE.WebGLRenderTarget(2, 2, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, type: THREE.HalfFloatType, depthBuffer: true, stencilBuffer: false, samples: 2 });
+// Optimized SDR render target: avoids HalfFloatType bandwidth & MSAA resolve stalls on integrated GPUs
+const rt = new THREE.WebGLRenderTarget(2, 2, {
+  minFilter: THREE.LinearFilter,
+  magFilter: THREE.LinearFilter,
+  type: THREE.UnsignedByteType,
+  depthBuffer: true,
+  stencilBuffer: false,
+  samples: 0
+});
 const postScene = new THREE.Scene();
 const postCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 // VHS post pass — port of Canvas UI "VHS" (tape wave, jitter, crease, head switching, bloom bleed,
@@ -3663,7 +3685,7 @@ const postMat = new THREE.ShaderMaterial({
       vec2 ip = smoothstep(vec2(0.0), vec2(1.0), mod(v * r, 1.0));
       return (h00 * (1.0 - ip.x) + h10 * ip.x) * (1.0 - ip.y) + (h01 * (1.0 - ip.x) + h11 * ip.x) * ip.y;
     }
-    float noise(vec2 v){ float sum = 0.0; float s = 2.0; for (int i = 1; i < 7; i++) { sum += iHash(v + vec2(float(i)), vec2(2.0 * s)) / s; s *= 2.0; } return sum; }
+    float noise(vec2 v){ return (iHash(v + vec2(1.0, 1.0), vec2(4.0)) * 0.65 + iHash(v + vec2(2.0, 2.0), vec2(8.0)) * 0.35); }
     vec3 tape(vec2 p){ p = clamp(p, vec2(0.0005), vec2(0.9995)); return texture2D(tDiffuse, p).rgb; }
     float bayer2(vec2 a){ a = floor(a); return fract(a.x * 0.5 + a.y * a.y * 0.75); }
     float bayer4(vec2 a){ return bayer2(0.5 * a) * 0.25 + bayer2(a); }
@@ -3689,9 +3711,12 @@ const postMat = new THREE.ShaderMaterial({
       col *= 1.0 - tcPhase;
       col = mix(col, col.yzx, clamp(snPhase, 0.0, 1.0));
       if (uBloom > 0.0) {
-        float px = uAberration / max(uRes.x, 1.0); vec3 bloomSum = vec3(0.0);
-        for (int i = -8; i <= 2; i++) { vec3 s = tape(uvn + vec2(float(i) * px, 0.0)); if (i >= -4) bloomSum.r += s.r; if (i >= -6 && i <= 0) bloomSum.g += s.g; if (i <= -2) bloomSum.b += s.b; }
-        bloomSum *= 0.1; col = mix(col, (col + bloomSum) / 1.7, clamp(uBloom, 0.0, 1.0));
+        float px = uAberration / max(uRes.x, 1.0);
+        vec3 bloomSum = tape(uvn + vec2(-4.0 * px, 0.0)) * 0.2 +
+                        tape(uvn + vec2(-2.0 * px, 0.0)) * 0.3 +
+                        tape(uvn) * 0.3 +
+                        tape(uvn + vec2(2.0 * px, 0.0)) * 0.2;
+        col = mix(col, (col + bloomSum) / 1.7, clamp(uBloom, 0.0, 1.0));
       }
       if (uAcBeat > 0.0) col *= 1.0 + clamp(noise(vec2(0.0, uv.y + t * 0.2)) * 0.6 - 0.25, 0.0, 0.1) * uAcBeat;
       vec2 vd = (uv - 0.5) * vec2(uRes.x / max(uRes.y, 1.0), 1.0);
@@ -3716,7 +3741,7 @@ const postMat = new THREE.ShaderMaterial({
 // CPU twin of the shader noise for the travelling crease (as in the original component)
 const vhsFract = (x) => x - Math.floor(x); const vhsHash2 = (x, y) => vhsFract(Math.sin(x * 89.44 + y * 19.36) * 22189.22); const vhsSmooth = (x) => x * x * (3 - 2 * x);
 function vhsIHash(vx, vy, r) { const fx = Math.floor(vx * r), fy = Math.floor(vy * r); const h00 = vhsHash2(fx / r, fy / r), h10 = vhsHash2((fx + 1) / r, fy / r), h01 = vhsHash2(fx / r, (fy + 1) / r), h11 = vhsHash2((fx + 1) / r, (fy + 1) / r); const ix = vhsSmooth(vhsFract(vx * r)), iy = vhsSmooth(vhsFract(vy * r)); return (h00 * (1 - ix) + h10 * ix) * (1 - iy) + (h01 * (1 - ix) + h11 * ix) * iy; }
-function vhsNoise(vx, vy) { let sum = 0, s = 2; for (let i = 1; i < 7; i++) { sum += vhsIHash(vx + i, vy + i, 2 * s) / s; s *= 2; } return sum; }
+function vhsNoise(vx, vy) { return Math.sin(vx * 3.7 + vy * 1.3) * 0.5 + 0.5; }
 let vhsTime = 0;
 function syncVHS(dt) {
   vhsTime += dt * VHS.speed; const u = postMat.uniforms;
@@ -4807,7 +4832,7 @@ scene.add(new THREE.AmbientLight(0xdde4ec, 0.5));
 scene.add(new THREE.HemisphereLight(0xcfe0f2, 0x8a6a44, 0.85));
 const sun = new THREE.DirectionalLight(0xffeccd, 2.7);
 sun.position.set(7.5, 9.5, 6.0); sun.target.position.set(-1.0, 0.6, -2.4); scene.add(sun, sun.target);
-sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048);
+const shadowRes = isPotatoDevice ? 1024 : 1024; sun.castShadow = true; sun.shadow.mapSize.set(shadowRes, shadowRes);
 sun.shadow.camera.left = -14; sun.shadow.camera.right = 14;
 sun.shadow.camera.top = 12; sun.shadow.camera.bottom = -6;
 sun.shadow.camera.near = 1; sun.shadow.camera.far = 34;
@@ -4818,7 +4843,10 @@ const warm3 = new THREE.PointLight(0xffe6c8, 5, 12, 2); warm3.position.set(-8.5,
 const arcadeLight = new THREE.PointLight(0xff4d00, 7, 6, 2); arcadeLight.position.set(-0.1, 1.35, -2.2); scene.add(arcadeLight);
 function spot(color, intensity, pos, target, angle, dist, shadow) {
   const s = new THREE.SpotLight(color, intensity, dist, angle, 0.6, 1.4); s.position.set(...pos); s.target.position.set(...target); scene.add(s, s.target);
-  if (shadow) { s.castShadow = true; s.shadow.mapSize.set(shadow, shadow); s.shadow.bias = -0.0006; s.shadow.normalBias = 0.02; s.shadow.camera.near = 0.5; s.shadow.camera.far = dist; s.shadow.radius = 4; }
+  if (shadow) {
+    const sRes = isPotatoDevice ? Math.min(shadow, 512) : Math.min(shadow, 1024);
+    s.castShadow = true; s.shadow.mapSize.set(sRes, sRes); s.shadow.bias = -0.0006; s.shadow.normalBias = 0.02; s.shadow.camera.near = 0.5; s.shadow.camera.far = dist; s.shadow.radius = isPotatoDevice ? 1 : 3;
+  }
   return s;
 }
 const key = spot(0xf3ecdc, 9, [2.6, 3.35, 0.9], [2.0, 0, -2.2], 0.95, 14, 2048);         // floor / dog / patches
@@ -5060,7 +5088,6 @@ const t0 = performance.now();
 let frame = 0, lastNow = t0, slowFrames = 0;
 const ease = (x) => x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
 function render(now) {
-  resize();
   const t = (now - t0) / 1000; const dt = Math.min(0.05, (now - lastNow) / 1000); lastNow = now;
   mouse.x += (mouse.tx - mouse.x) * 0.06; mouse.y += (mouse.ty - mouse.y) * 0.06;
   const [cp, cl] = targets();
@@ -5078,17 +5105,27 @@ function render(now) {
     slider.front.position.x = slider.shut + (slider.open - slider.shut) * slider.t;
   }
   gameStep(dt); gameDraw(t);
-  if (frame % 2 === 1) { drawMarquee(t); drawTicker(t); }
-  if (frame % 4 === 2) drawPhone(t);
+  // 15 FPS texture update for LED dot matrix & arcade marquee saves 50% WebGL texture upload bus stalls
+  if (frame % 4 === 1) { drawMarquee(t); drawTicker(t); }
+  if (frame % 8 === 2) drawPhone(t);
   // neon buzz + occasional dropout
   if (neon.plane) { if (neon.off > 0) neon.off--; else if (Math.random() < 0.006) neon.off = 2 + ((Math.random() * 6) | 0); const buzz = 0.93 + 0.07 * Math.sin(t * 60) * Math.sin(t * 7.3); const lvl = neon.off ? 0.35 : buzz; neon.plane.material.opacity = lvl; neon.light.intensity = 7 * lvl; neon.glow.material.opacity = 0.12 * lvl; }
   if (state.mode === 'hoop') ballStep(dt);
-  if (frame % 2 === 0) { drawStatic(staticTexA, t, false); drawStatic(staticTexB, t, true); for (const tx of tvTextures) tx.needsUpdate = true; }
+  if (frame % 6 === 0) { drawStatic(staticTexA, t, false); drawStatic(staticTexB, t, true); for (const tx of tvTextures) tx.needsUpdate = true; }
   TV.forEach((tv, i) => {
     const focused = state.mode === 'tv' && state.tvIndex === i;
-    if (focused || (frame + i) % 6 === 0) { tv.site.draw(tv.ctx, 640, 480, t); tv.tex.needsUpdate = true; }
+    // Smart round-robin: in room mode, update only 1 TV canvas per 12 frames. In TV mode, smoothly update the active TV!
+    const shouldUpdate = state.mode === 'tv'
+      ? (focused ? (frame % 2 === 0) : ((frame + i) % 24 === 0))
+      : (frame % 12 === i);
+    if (shouldUpdate) {
+      tv.site.draw(tv.ctx, 640, 480, t);
+      tv.tex.needsUpdate = true;
+    }
     const target = state.mode === 'tv' ? (focused ? 0.05 : 0.45) : 0.7;
-    tv.snowLevel += (target - tv.snowLevel) * 0.08; tv.snow.material.opacity = tv.snowLevel; tv.light.intensity = 0.7 + (1 - tv.snowLevel) * 0.8;
+    tv.snowLevel += (target - tv.snowLevel) * 0.08;
+    tv.snow.material.opacity = tv.snowLevel;
+    tv.light.intensity = 0.7 + (1 - tv.snowLevel) * 0.8;
   });
   arcadeLight.intensity = 6 + Math.sin(t * 6) * 1.2 + Math.sin(t * 17) * 0.5;
   postMat.uniforms.uFade.value = Math.min(1, Math.max(0, (t - 0.25) / 1.4));
@@ -5106,8 +5143,19 @@ function loop(now) {
   const visible = (window.scrollY || 0) < lastH * 0.95 || document.body.classList.contains('machine');
   if (visible && !document.hidden) {
     if (ball.live || shadowDirty > 0) { renderer.shadowMap.needsUpdate = true; if (!ball.live) shadowDirty--; }
-    const a = performance.now(); render(now); const cost = performance.now() - a;
-    if (cost > 22) { if (++slowFrames > 60 && DPR > 1) { DPR = Math.max(1, DPR - 0.5); slowFrames = 0; } } else slowFrames = Math.max(0, slowFrames - 1);
+    const a = performance.now();
+    render(now);
+    const cost = performance.now() - a;
+    // Auto frame-drop protector: adapts DPR dynamically if frame takes > 18ms
+    if (cost > 18) {
+      if (++slowFrames > 15 && DPR > 0.85) {
+        DPR = Math.max(0.85, DPR - 0.15);
+        resize();
+        slowFrames = 0;
+      }
+    } else {
+      slowFrames = Math.max(0, slowFrames - 1);
+    }
     roomLoopRunning = true;
     requestAnimationFrame(loop);
   } else {
@@ -5826,7 +5874,10 @@ window.__sheet = {group, mat, uni, renderer, scene, camera, mesh,
 
   // VHS overlay for the DOM: grain, scanlines, head-switching band and AC beat as a screen-blended layer.
   (function () {
-    const cv = document.getElementById('vhs-overlay'); const gl = cv.getContext('webgl2', { alpha: true, antialias: false, premultipliedAlpha: true });
+    const cv = document.getElementById('vhs-overlay');
+    // If hidden in CSS, completely bypass WebGL2 context and loop to free 100% GPU resources on potato devices
+    if (!cv || window.getComputedStyle(cv).display === 'none') return;
+    const gl = cv.getContext('webgl2', { alpha: true, antialias: false, premultipliedAlpha: true });
     if (!gl) return;
     const cfg = () => window.VHS || { speed: .5, switching: .05, switchingHeight: .02, acBeat: 1, grain: .1, scanlines: .1, jitter: .25 };
     const V = `#version 300 es
