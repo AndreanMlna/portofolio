@@ -2276,6 +2276,44 @@ canvas {
   text-decoration: underline;
 }
 
+
+/* --- HIGH-PERFORMANCE GPU COMPOSITING (ZERO LAG & 60FPS) --- */
+.hero .framed,
+.hero-headline-box,
+.hero-lede-box,
+.tech-bento-card,
+.exp-card-pro,
+.cred-card,
+.proj-card,
+.term-window {
+  transform: translateZ(0);
+  -webkit-transform: translateZ(0);
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+.hero-headline-box {
+  backdrop-filter: blur(8px) !important;
+  -webkit-backdrop-filter: blur(8px) !important;
+}
+.hero-lede-box {
+  backdrop-filter: blur(8px) !important;
+}
+.tech-bento-card {
+  backdrop-filter: blur(8px) !important;
+  -webkit-backdrop-filter: blur(8px) !important;
+}
+.exp-card-pro {
+  backdrop-filter: blur(8px) !important;
+  -webkit-backdrop-filter: blur(8px) !important;
+}
+
+#experience,
+#credentials,
+#projects {
+  content-visibility: auto;
+  contain-intrinsic-size: 600px;
+}
 </style>
 </head>
 <body>
@@ -5087,16 +5125,27 @@ renderer.shadowMap.autoUpdate = false;
 renderer.shadowMap.needsUpdate = true;
 let shadowDirty = 2;
 window.markShadows = () => { shadowDirty = 2; };
+let roomLoopRunning = false;
 function loop(now) {
-  // the lobby is the backdrop for the machine screen now, so it keeps drawing there
-  const visible = (window.scrollY || 0) < lastH * 1.05 || document.body.classList.contains('machine');
-  if (visible) {
+  const visible = (window.scrollY || 0) < lastH * 0.95 || document.body.classList.contains('machine');
+  if (visible && !document.hidden) {
     if (ball.live || shadowDirty > 0) { renderer.shadowMap.needsUpdate = true; if (!ball.live) shadowDirty--; }
     const a = performance.now(); render(now); const cost = performance.now() - a;
     if (cost > 22) { if (++slowFrames > 60 && DPR > 1) { DPR = Math.max(1, DPR - 0.5); slowFrames = 0; } } else slowFrames = Math.max(0, slowFrames - 1);
+    roomLoopRunning = true;
+    requestAnimationFrame(loop);
+  } else {
+    roomLoopRunning = false;
   }
-  requestAnimationFrame(loop);
 }
+
+window.addEventListener('scroll', () => {
+  const visible = (window.scrollY || 0) < lastH * 0.95 || document.body.classList.contains('machine');
+  if (visible && !roomLoopRunning && !document.hidden) {
+    roomLoopRunning = true;
+    requestAnimationFrame(loop);
+  }
+}, { passive: true });
 state.camFrom.copy(camBase); state.lookFrom.copy(camLook); camera.position.copy(camBase);
 resize();
 render(performance.now());
@@ -5130,14 +5179,32 @@ window.__sblvl = { scene, camera, renderer, state, game, ball, TV, characters, b
     saturation: 1.00
   };
 
+  // Precompute Color Look-Up Table (256 entries) to eliminate 28,000+ string allocations per frame
+  const COLOR_LUT = new Array(256);
+  for (let i = 0; i < 256; i++) {
+    const intensity = i / 255;
+    let r = Math.min(255, 60 * intensity + 100 * Math.pow(intensity, 3));
+    let g = Math.min(255, 20 * intensity + 60 * Math.pow(intensity, 4));
+    let b = Math.min(255, 120 * intensity + 135 * Math.pow(intensity, 2));
+    if (intensity > 0.7) {
+      const coreBoost = (intensity - 0.7) * 3.3;
+      r = Math.min(255, r + 150 * coreBoost);
+      g = Math.min(255, g + 150 * coreBoost);
+      b = Math.min(255, b + 150 * coreBoost);
+    }
+    COLOR_LUT[i] = 'rgb(' + Math.floor(r * options.brightness) + ',' + Math.floor(g * options.brightness) + ',' + Math.floor(b * options.brightness) + ')';
+  }
+
   let width = 1;
   let height = 1;
   let time = 0;
+  let isVisible = false;
 
   function resize() {
     width = Math.max(1, window.innerWidth || container.clientWidth || 1);
     height = Math.max(1, window.innerHeight || container.clientHeight || 1);
-    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    // Cap pixelRatio to 1.25 for crisp pixel grid aesthetics without fill-rate bottleneck
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 1.25);
     canvas.width = Math.round(width * pixelRatio);
     canvas.height = Math.round(height * pixelRatio);
     context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
@@ -5152,49 +5219,83 @@ window.__sblvl = { scene, camera, renderer, state, game, ball, TV, characters, b
     const archPeakY = height * 0.35;
     const archWidth = width * 1.5;
     const archHeight = height * options.archHeight;
+    const halfArchWidth = archWidth / 2;
+    const spacing = options.spacing;
+    const dotSize = options.dotSize;
+
+    // Bounds culling: only iterate columns where intensity can be > 0 (abs(normX) <= 1.15)
+    const xMin = Math.max(0, Math.floor((centerX - halfArchWidth * 1.15) / spacing) * spacing);
+    const xMax = Math.min(width, Math.ceil((centerX + halfArchWidth * 1.15) / spacing) * spacing);
+
     context.globalCompositeOperation = 'lighter';
 
-    for (let x = 0; x < width; x += options.spacing) {
-      const normX = (x - centerX) / (archWidth / 2);
+    for (let x = xMin; x < xMax; x += spacing) {
+      const normX = (x - centerX) / halfArchWidth;
+      const absNormX = Math.abs(normX);
+      if (absNormX > 1.15) continue;
+
       const curveY = archPeakY + normX * normX * archHeight;
-      for (let y = 0; y < height; y += options.spacing) {
+      const thickness = (140 + (1 - absNormX) * 80) * options.thickness;
+      
+      // Vertical bounds culling: skip empty space above and below the arch band
+      const startY = Math.max(0, Math.floor((curveY - thickness) / spacing) * spacing);
+      const endY = Math.min(height, Math.ceil((curveY + thickness) / spacing) * spacing);
+      if (startY >= endY) continue;
+
+      const normXTerm = Math.max(0, 1 - Math.pow(absNormX, 2.5));
+      const waveX = Math.sin(x * 0.015 + time);
+
+      for (let y = startY; y <= endY; y += spacing) {
         const distanceToCurve = Math.abs(y - curveY);
-        const thickness = (140 + (1 - Math.abs(normX)) * 80) * options.thickness;
         if (distanceToCurve >= thickness) continue;
+
         let intensity = 1 - distanceToCurve / thickness;
-        const waveX = Math.sin(x * 0.015 + time);
         const waveY = Math.cos(y * 0.02 + time);
-        intensity = intensity * 0.7 + waveX * waveY * 0.3 * intensity;
-        intensity *= Math.max(0, 1 - Math.pow(Math.abs(normX), 2.5));
+        intensity = (intensity * 0.7 + waveX * waveY * 0.3 * intensity) * normXTerm;
         if (intensity <= 0.02) continue;
 
-        let r = Math.min(255, 60 * intensity + 100 * Math.pow(intensity, 3));
-        let g = Math.min(255, 20 * intensity + 60 * Math.pow(intensity, 4));
-        let b = Math.min(255, 120 * intensity + 135 * Math.pow(intensity, 2));
-        if (intensity > 0.7) {
-          const coreBoost = (intensity - 0.7) * 3.3;
-          r = Math.min(255, r + 150 * coreBoost);
-          g = Math.min(255, g + 150 * coreBoost);
-          b = Math.min(255, b + 150 * coreBoost);
-        }
-        context.fillStyle = 'rgb(' + Math.floor(r * options.brightness) + ',' + Math.floor(g * options.brightness) + ',' + Math.floor(b * options.brightness) + ')';
-        context.fillRect(x, y, options.dotSize * intensity, options.dotSize * intensity);
+        const lutIdx = (intensity * 255) | 0;
+        context.fillStyle = COLOR_LUT[lutIdx < 0 ? 0 : (lutIdx > 255 ? 255 : lutIdx)];
+        const curDotSize = dotSize * intensity;
+        context.fillRect(x, y, curDotSize, curDotSize);
       }
     }
     context.globalCompositeOperation = 'source-over';
   }
 
-  window.addEventListener('resize', resize);
+  window.addEventListener('resize', resize, { passive: true });
   resize();
 
+  // Smart Visibility & Scroll Observer:
+  // When scrollY < 30, the 3D room completely obscures this canvas. Pause rendering to give 100% GPU/CPU to 3D room.
   let frame = 0;
-  function loop() {
-    if (!document.hidden) {
-      render();
+  function updateVisibility() {
+    const scrollY = window.scrollY || 0;
+    const shouldRender = !document.hidden && scrollY >= 30;
+    if (shouldRender !== isVisible) {
+      isVisible = shouldRender;
+      if (isVisible && !frame) {
+        frame = requestAnimationFrame(loop);
+      }
     }
+  }
+
+  window.addEventListener('scroll', updateVisibility, { passive: true });
+  document.addEventListener('visibilitychange', updateVisibility);
+  updateVisibility();
+
+  function loop() {
+    if (isVisible) {
+      render();
+      frame = requestAnimationFrame(loop);
+    } else {
+      frame = 0;
+    }
+  }
+  
+  if (isVisible) {
     frame = requestAnimationFrame(loop);
   }
-  frame = requestAnimationFrame(loop);
 })();
 </script>
 

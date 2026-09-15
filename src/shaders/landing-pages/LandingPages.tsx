@@ -702,7 +702,7 @@ export function HalvorsenLandingPage(props: LandingPageProps & PageTypographyPro
 }
 
 export function SublevelStudioLandingPage(props: LandingPageProps) {
-  return <LandingPageFrame {...props} title="Andrian Maulana — AI, Machine Learning & Fullstack Systems" sourceUrl="/landing-pages/sublevel-studio.html?v=7" />;
+  return <LandingPageFrame {...props} title="Andrian Maulana — AI, Machine Learning & Fullstack Systems" sourceUrl="/landing-pages/sublevel-studio.html?v=8" />;
 }
 
 // The authored file is named cogniwave.html; the page it holds is Understory.
